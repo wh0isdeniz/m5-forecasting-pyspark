@@ -1,89 +1,99 @@
-# Retail Demand Forecasting on Walmart M5 (PySpark + Databricks)
+# Retail Demand Forecasting — Walmart M5 (PySpark)
 
-End-to-end demand forecasting pipeline built on the **Walmart M5** dataset using **PySpark** on **Databricks**. Starting from 59M raw sales records, the project engineers time-series features and trains a Gradient Boosted Trees model that beats a naive baseline by **20% on RMSE**.
-
-**TL;DR:** Predicted daily unit sales for 30,490 item–store series across 3 US states. GBT model reached **Test RMSE 2.14 / MAE 1.03**, outperforming a naive lag-7 baseline (RMSE 2.68) by **20%**. At the aggregate level, daily total demand is predicted within **4.1% mean absolute error**.
+An end-to-end demand forecasting pipeline on the **Walmart M5** dataset, built with **PySpark** on **Databricks**. The goal is to predict daily unit sales for 30,490 item–store series and quantify how much a Gradient Boosted Trees model with engineered time-series features improves over a naive baseline — on data where **68% of item-days have zero sales**.
 
 ---
 
 ## Results
 
 | Model | Test RMSE | Test MAE |
-|---|---|---|
-| Naive baseline (last week's sales) | 2.68 | 1.24 |
+|-------|:---------:|:--------:|
+| Naive baseline — repeat last week | 2.68 | 1.24 |
 | **Gradient Boosted Trees** | **2.14** | **1.03** |
-| Improvement | **−20.1%** | **−17.5%** |
 
-At the **aggregate** (all-products daily total) level, the model is far more accurate than on individual series — mean absolute error of **4.1%** and a small **−1.2%** bias.
+The GBT model improves over the naive baseline by **20.1% (RMSE)** and **17.5% (MAE)**. At the aggregate level, daily total demand is predicted within **4.1% mean absolute error**.
+
+Evaluated on a held-out final 28 days (Apr 25 – May 22, 2016) — a strict chronological split with no future leakage.
 
 ---
 
 ## Dataset
 
-The [M5 Forecasting dataset](https://www.kaggle.com/competitions/m5-forecasting-accuracy) contains 5+ years of daily Walmart sales:
+- **M5 Forecasting** — 5+ years of daily Walmart sales (2011-01-29 → 2016-05-22, 1,941 days)
+- **30,490 series**: 3,049 products × 10 stores across CA, TX, WI
+- **3 categories** (FOODS, HOUSEHOLD, HOBBIES), 7 departments
+- Auxiliary tables: daily calendar (holidays, sporting events, SNAP benefit days) and weekly item prices
+- Highly intermittent demand: median 0, mean 1.13, max 763 — **68% zeros**
 
-- **30,490** item–store combinations (3,049 products × 10 stores)
-- **1,941 days** of history (2011-01-29 → 2016-05-22)
-- **3 categories** (FOODS, HOUSEHOLD, HOBBIES), **7 departments**, **3 states** (CA, TX, WI)
-- Auxiliary tables: daily calendar (events, SNAP benefit days) and weekly item prices
-
-After reshaping from wide to long format, the working dataset is **~59M rows**.
+After unpivoting from wide format (1,941 day-columns) to long format: **~59M rows**.
 
 ---
 
 ## Pipeline
 
-The project runs entirely on Spark, in two notebooks:
-
 **`m5_01_data_loading`** — data engineering
-- Read 3 CSVs with **explicit schemas** (avoids costly `inferSchema` on 1,947-column sales file)
-- **Unpivot** the wide sales table (1,941 day-columns → long format, 59M rows)
-- **Broadcast join** with the tiny calendar table; **sort-merge join** with the 6.8M-row price table
-- Feature engineering via **window functions**: lag (7, 28), rolling mean/std (7, 28), price lags & change ratio, SNAP and event flags
+
+- Read 3 CSVs with **explicit schemas** (no double-scan from `inferSchema` on a 1,947-column file)
+- **Unpivot** wide sales table → 59M-row long format
+- **Broadcast join** with calendar (tiny table); **sort-merge join** with 6.8M-row price table
+- Feature engineering via **window functions**: sales lags (7, 28), rolling mean/std (7, 28), price lag & change ratio, SNAP and event flags
+- Rolling frames **exclude the current row** — no target leakage
 - Persist to a **Delta table** for fast downstream reads
 
 **`m5_02_modeling`** — machine learning
-- **Chronological** train/test split (last 28 days held out — no leakage)
-- MLlib `Pipeline`: `StringIndexer` → `OneHotEncoder` → `VectorAssembler` → `GBTRegressor`
-- Trained on a recent 2-year window (addresses distribution shift; ~21.7M rows)
-- Evaluation against a naive baseline, feature importance, and error analysis
+
+- **Chronological split**: last 28 days held out (the actual forecast horizon)
+- MLlib Pipeline: `StringIndexer → OneHotEncoder → VectorAssembler → GBTRegressor`
+- Trained on the most recent 2 years (~21.7M rows) to address upward demand drift
+- Evaluated against a naive lag-7 baseline, plus feature importance and error analysis
 
 ---
 
-## Key Findings
+## Feature Importance
 
-### 1. Past sales dominate the signal
-The top four features — all derived from sales history — account for **79%** of total feature importance. The 7-day rolling mean alone contributes 40%.
+<img width="1187" height="709" alt="fig1_feature_importance" src="https://github.com/user-attachments/assets/f82ed147-a5e5-46ab-9576-e12aa173b33e" />
 
-![Feature importance](images/fig1_feature_importance.png)
-
-### 2. The model tracks trends but shaves peaks
-On individual products, the model follows the overall shape of demand but **systematically under-predicts spikes** — a known consequence of minimizing squared error on zero-inflated data (68% of rows have zero sales).
-
-![Forecast vs actual](images/fig2_forecast_vs_actual.png)
-
-### 3. Errors cancel at the aggregate level
-Individual under-predictions offset each other when summed. Daily **total** demand is predicted within **4.1%** mean absolute error and only **−1.2%** bias — mirroring a core principle of hierarchical forecasting: aggregate forecasts are far more reliable than item-level ones, which is exactly what warehouse-level inventory planning needs.
-
-![Aggregate forecast](images/fig3_aggregate.png)
-
-### 4. Under-prediction is systematic, not random
-Residuals (prediction − actual) on non-zero sales are centered at **−0.79**, confirming the conservative bias observed above.
-
-![Residual distribution](images/fig4_residuals.png)
+The top four features — all derived from sales history — account for **79%** of total importance. The 7-day rolling mean alone contributes **40%**: in demand forecasting, the recent past is the best predictor of the near future. Price, store identity and SNAP days act as refinements, not drivers.
 
 ---
 
-## Techniques Demonstrated
+## Forecast vs Actual
 
-- **Distributed data processing** on 59M rows with PySpark
-- **Wide-to-long reshaping** with `unpivot`
-- **Join strategy**: broadcast vs sort-merge, chosen by table size
-- **Window functions** for time-series lag and rolling features (with leakage-safe framing that excludes the current row)
-- **Delta Lake** for materialized, fast-read intermediate storage
-- **MLlib Pipelines** with proper categorical encoding
-- **Leakage-free chronological splitting** for time-series validation
-- **Baseline-relative evaluation** and multi-level error analysis
+<img width="1429" height="1137" alt="fig2_forecast_vs_actual" src="https://github.com/user-attachments/assets/01c9321a-1a25-41b6-b9e2-b55a5e3fc2b8" />
+
+The model tracks steady mid-volume products closely (middle panel) but **systematically under-predicts demand spikes** — the expected cost of minimizing squared error on zero-inflated data, where the safest guess is always a low one.
+
+---
+
+## Aggregate Accuracy
+
+<img width="1549" height="589" alt="fig3_aggregate" src="https://github.com/user-attachments/assets/fb181dbd-51a5-4c53-bf6e-61f7a1b24025" />
+
+Summed across all 30,490 series, individual errors cancel: daily total demand lands within **4.1%** on average with only **−1.2%** bias. Aggregate forecasts are far more reliable than item-level ones — exactly the level at which warehouse inventory planning operates.
+
+---
+
+## Residual Analysis
+
+<img width="1309" height="589" alt="fig4_residuals" src="https://github.com/user-attachments/assets/268402e9-f2a3-419f-9276-f3868c450db6" />
+
+Residuals on non-zero-sales days center at **−0.79 units** rather than zero — the under-prediction is systematic, not noise, and points directly at the loss function as the next lever.
+
+---
+
+## Summary
+
+**What the model gets right:**
+
+- **+20% over naive baseline** — engineered lag/rolling features add real signal
+- **Strong aggregate accuracy (4.1%)** — reliable at the inventory-planning level
+- **Leakage-free by construction** — chronological split, current-row-excluded rolling windows
+
+**Where it falls short, and why:**
+
+- **Peak shaving** — squared-error loss + 68% zeros pushes predictions low
+- **Fix**: a Tweedie or quantile objective would trade some over-forecasting for catching peaks — usually the right trade-off, since a missed sale costs more than a spare unit on the shelf
+- **Two-stage design** (sell / don't sell, then quantity) would address zero-inflation head-on
 
 ---
 
@@ -91,17 +101,12 @@ Residuals (prediction − actual) on non-zero sales are centered at **−0.79**,
 
 Python · PySpark · Spark MLlib · Delta Lake · Databricks · Matplotlib
 
-## Next Steps
+---
 
-- **Tweedie / quantile loss** to correct the under-prediction bias on demand peaks
-- **Two-stage model** (zero vs non-zero, then count) for the 68% intermittent-demand rows
-- **Hyperparameter tuning** with time-series cross-validation
-- **Item-level intro-date handling** to distinguish "not yet on shelf" from genuine zeros
+## Usage
 
-## Reproducing
+1. Download the [M5 dataset](https://www.kaggle.com/competitions/m5-forecasting-accuracy/data) and upload `calendar.csv`, `sales_train_evaluation.csv`, `sell_prices.csv` to a Databricks volume
+2. Run `m5_01_data_loading` to build the feature table
+3. Run `m5_02_modeling` to train and evaluate
 
-1. Download the [M5 dataset](https://www.kaggle.com/competitions/m5-forecasting-accuracy/data) and upload `calendar.csv`, `sales_train_evaluation.csv`, `sell_prices.csv` to a Databricks volume.
-2. Run `m5_01_data_loading` to build the feature table.
-3. Run `m5_02_modeling` to train and evaluate.
-
-Built and run on **Databricks Free Edition** (serverless compute).
+Runs end-to-end on **Databricks Free Edition** (serverless compute).
